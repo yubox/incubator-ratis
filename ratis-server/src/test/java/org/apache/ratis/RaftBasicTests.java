@@ -94,6 +94,48 @@ public abstract class RaftBasicTests extends BaseTest {
         .forEach(log -> RaftTestUtil.assertLogEntries(log,
             log.getEntries(1, Long.MAX_VALUE), 1, term, messages));
   }
+  
+  @Test
+  public void testOldLeaderCommit() throws Exception {
+    LOG.info("Running testOldLeaderCommit");
+    final String leaderId = "s" + ThreadLocalRandom.current().nextInt(NUM_SERVERS);
+    LOG.info("enforce leader to " + leaderId);
+    final MiniRaftCluster cluster = getCluster();
+    waitForLeader(cluster);
+    RaftServerImpl leader = waitForLeader(cluster, leaderId);
+
+    List<RaftServerImpl> followers = cluster.getFollowers();
+    final RaftServerImpl nextLeaderWithOldLog = followers.get(0);
+    final RaftServerImpl serverToTakeDown = followers.get(1);
+
+    cluster.killServer(serverToTakeDown.getId());
+
+    SimpleMessage[] messages = SimpleMessage.create(1);
+    try(final RaftClient client = cluster.createClient(null)) {
+      for (SimpleMessage message: messages) {
+        client.send(message);
+      }
+    }
+
+    Thread.sleep(cluster.getMaxTimeout() + 100);
+    LOG.info(cluster.printAllLogs());
+
+    cluster.getServerAliveStream()
+            .map(s -> s.getState().getLog())
+            .forEach(log -> RaftTestUtil.assertLogEntries(log,
+                    log.getEntries(1, Long.MAX_VALUE), 1, leader.getState().getCurrentTerm(), messages));
+
+    final RaftServerImpl newLeader = waitForLeader(cluster, nextLeaderWithOldLog.toString());
+    cluster.startServer(serverToTakeDown.getId());
+
+    Thread.sleep(cluster.getMaxTimeout() + 100);
+    LOG.info(cluster.printAllLogs());
+
+    RaftLog log = serverToTakeDown.getState().getLog();
+    RaftTestUtil.assertLogEntries(log, log.getEntries(1, Long.MAX_VALUE),
+            1, newLeader.getState().getCurrentTerm(), messages);
+
+  }
 
   @Test
   public void testEnforceLeader() throws Exception {
