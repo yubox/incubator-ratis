@@ -20,12 +20,21 @@ package org.apache.ratis;
 import org.apache.ratis.RaftTestUtil.SimpleMessage;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.server.impl.BlockRequestHandlingInjection;
 import org.apache.ratis.server.impl.RaftServerImpl;
+import org.apache.ratis.server.storage.RaftLog;
 import org.junit.*;
+import org.junit.rules.Timeout;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import static org.apache.ratis.RaftTestUtil.logEntriesContains;
 import static org.apache.ratis.RaftTestUtil.waitAndKillLeader;
 import static org.apache.ratis.RaftTestUtil.waitForLeader;
+import static org.apache.ratis.util.Preconditions.assertTrue;
+import static org.junit.Assert.assertFalse;
 
 import java.io.IOException;
 import java.util.List;
@@ -34,7 +43,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-public abstract class RaftBasicTests extends BaseTest {
+public abstract class RaftBasicTests {
+  public static final Logger LOG = LoggerFactory.getLogger(RaftBasicTests.class);
+
   public static final int NUM_SERVERS = 5;
 
   protected static final RaftProperties properties = new RaftProperties();
@@ -44,6 +55,9 @@ public abstract class RaftBasicTests extends BaseTest {
   public RaftProperties getProperties() {
     return properties;
   }
+
+  @Rule
+  public Timeout globalTimeout = new Timeout(120 * 1000);
 
   @Before
   public void setup() throws IOException {
@@ -94,21 +108,20 @@ public abstract class RaftBasicTests extends BaseTest {
         .forEach(log -> RaftTestUtil.assertLogEntries(log,
             log.getEntries(1, Long.MAX_VALUE), 1, term, messages));
   }
-  
+
   @Test
   public void testOldLeaderCommit() throws Exception {
     LOG.info("Running testOldLeaderCommit");
-    final String leaderId = "s" + ThreadLocalRandom.current().nextInt(NUM_SERVERS);
-    LOG.info("enforce leader to " + leaderId);
     final MiniRaftCluster cluster = getCluster();
-    waitForLeader(cluster);
-    RaftServerImpl leader = waitForLeader(cluster, leaderId);
+    RaftTestUtil.waitForLeader(cluster);
+    final RaftPeerId leaderId = waitForLeader(cluster).getId();
 
     List<RaftServerImpl> followers = cluster.getFollowers();
-    final RaftServerImpl nextLeaderWithOldLog = followers.get(0);
-    final RaftServerImpl serverToTakeDown = followers.get(1);
-
-    cluster.killServer(serverToTakeDown.getId());
+    final RaftServerImpl followerToCommit = followers.get(0);
+    for (int i = 1; i < NUM_SERVERS - 1; i++) {
+      RaftServerImpl follower = followers.get(i);
+      cluster.killServer(follower.getId());
+    }
 
     SimpleMessage[] messages = SimpleMessage.create(1);
     try(final RaftClient client = cluster.createClient(null)) {
@@ -118,23 +131,59 @@ public abstract class RaftBasicTests extends BaseTest {
     }
 
     Thread.sleep(cluster.getMaxTimeout() + 100);
-    LOG.info(cluster.printAllLogs());
+    logEntriesContains(followerToCommit.getState().getLog(), messages);
+
+    BlockRequestHandlingInjection.getInstance().blockReplier(leaderId.toString());
+    RaftTestUtil.setBlockRequestsFrom(leaderId.toString(), true);
+    for (int i = 1; i < 3; i++) {
+      RaftServerImpl follower = followers.get(i);
+      cluster.restartServer(follower.getId(), false );
+    }
+    waitForLeader(cluster);
+    Thread.sleep(cluster.getMaxTimeout() + 100);
 
     cluster.getServerAliveStream()
             .map(s -> s.getState().getLog())
-            .forEach(log -> RaftTestUtil.assertLogEntries(log,
-                    log.getEntries(1, Long.MAX_VALUE), 1, leader.getState().getCurrentTerm(), messages));
+            .forEach(log -> assertTrue(logEntriesContains(log, messages)));
+  }
 
-    final RaftServerImpl newLeader = waitForLeader(cluster, nextLeaderWithOldLog.toString());
-    cluster.startServer(serverToTakeDown.getId());
+  @Test
+  public void testOldLeaderNotCommit() throws Exception {
+    LOG.info("Running testOldLeaderNotCommit");
+    final MiniRaftCluster cluster = getCluster();
+    RaftTestUtil.waitForLeader(cluster);
+    final RaftPeerId leaderId = waitForLeader(cluster).getId();
+
+    List<RaftServerImpl> followers = cluster.getFollowers();
+    final RaftServerImpl followerToCommit = followers.get(0);
+    for (int i = 1; i < NUM_SERVERS - 1; i++) {
+      RaftServerImpl follower = followers.get(i);
+      cluster.killServer(follower.getId());
+    }
+
+    SimpleMessage[] messages = SimpleMessage.create(1);
+    try(final RaftClient client = cluster.createClient(null)) {
+      for (SimpleMessage message: messages) {
+        client.send(message);
+      }
+    }
 
     Thread.sleep(cluster.getMaxTimeout() + 100);
-    LOG.info(cluster.printAllLogs());
+    logEntriesContains(followerToCommit.getState().getLog(), messages);
 
-    RaftLog log = serverToTakeDown.getState().getLog();
-    RaftTestUtil.assertLogEntries(log, log.getEntries(1, Long.MAX_VALUE),
-            1, newLeader.getState().getCurrentTerm(), messages);
+    cluster.killServer(leaderId);
+    cluster.killServer(followerToCommit.getId());
 
+    for (int i = 1; i < NUM_SERVERS - 1; i++) {
+      RaftServerImpl follower = followers.get(i);
+      cluster.restartServer(follower.getId(), false );
+    }
+    waitForLeader(cluster);
+    Thread.sleep(cluster.getMaxTimeout() + 100);
+
+    cluster.getServerAliveStream()
+            .map(s -> s.getState().getLog())
+            .forEach(log -> assertFalse(logEntriesContains(log, messages)));
   }
 
   @Test
@@ -216,7 +265,7 @@ public abstract class RaftBasicTests extends BaseTest {
         LOG.info("Block all requests sent by leader " + oldLeader);
         RaftPeerId newLeader = RaftTestUtil.changeLeader(cluster, oldLeader);
         LOG.info("Changed leader from " + oldLeader + " to " + newLeader);
-        Assert.assertFalse(newLeader.equals(oldLeader));
+        assertFalse(newLeader.equals(oldLeader));
       }
     }
 
